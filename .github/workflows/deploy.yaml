@@ -1,0 +1,121 @@
+name: Deploy knowledge base
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - .gitignore
+      - README.md
+      - CONTRIBUTING.md
+      - LICENSE
+      - LICENSE.txt
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: knowledge-base-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Run linters
+        run: npm run lint:all
+      - name: Check documentation URLs
+        env:
+          URL_CHECKER_TIMEOUT: ${{ vars.URL_CHECKER_TIMEOUT || '5' }}
+        run: node script/url-checker.js --timeout "$URL_CHECKER_TIMEOUT"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      site_url: ${{ steps.pages.outputs.base_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Configure GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        id: pages
+        uses: actions/configure-pages@1f0c5cde4bc74cd7e1254d0cb4de8d49e9068c7d # v4.0.0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Build production site
+        env:
+          NODE_ENV: production
+          PATH_PREFIX: /${{ github.event.repository.name }}/
+        run: |
+          npm run sass:prod
+          npm run eleventy:prod
+      - name: Upload built site
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: _site
+
+  deploy:
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      pages: write
+      id-token: write
+      issues: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download built site
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/pages-artifact
+      - name: Verify Pages archive
+        run: test -s "$RUNNER_TEMP/pages-artifact/artifact.tar"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        with:
+          timeout: 60000
+      - name: Report deployment status
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOYMENT_OUTCOME: ${{ steps.deployment.outcome }}
+          SITE_URL: ${{ steps.deployment.outputs.page_url || needs.build.outputs.site_url }}
+        run: |
+          status=failed
+          if [[ "$DEPLOYMENT_OUTCOME" == "success" ]]; then
+            status=succeeded
+          fi
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$(date -u +%F) - Deployment: $status" \
+            --body "URL: $SITE_URL"
